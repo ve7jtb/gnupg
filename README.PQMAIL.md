@@ -78,65 +78,122 @@ Run the software-only connector tests from this repository:
 python3 -B -m unittest discover -s pqmail/tests -v
 ```
 
-The review update passed **24 tests**, including SHA-256 compatibility, retained
-ML-DSA restrictions, patch-preflight/rollback failures, blocked stdin, output
-floods and nested descendant cleanup. The identical supervisor passed seven
-additional executions on the software branch. Patch anchors were checked
-against clean GnuPG 2.5.23 and 2.5.24 sources; test fixtures use temporary files
-and synthetic subprocesses, without hardware or account access.
+The connector and reusable harness now pass **39 software-only tests**: 24
+connector regressions and 15 orchestration/preflight regressions. Coverage
+includes SHA-256 compatibility, retained ML-DSA restrictions, patch rollback,
+blocked stdin, output limits, nested process cleanup, selected installed-jar
+paths, real GnuPG status lines, error stopping and final audits after failure.
+The identical supervisor also passed seven executions on the separate software
+branch. Patch anchors were checked against clean GnuPG 2.5.23 and 2.5.24 sources.
+These automated checks use temporary fixtures and synthetic subprocesses;
+they do not access accounts, ask for a PIN or contact hardware.
 
-Separate authorized hardware testing with the development GnuPG core and the
-existing PKCS#11 backend verified:
+An authorized hardware rerun with the reviewed installed Mac backend and
+fixed GnuPG sender passed all **five private operations**:
 
-- v4 Ed25519 signing, independently verified by stock GnuPG and PQ Mail;
-- ML-KEM-768/X25519 decryption of PQ Mail and fixed-GnuPG ciphertexts, with
-  byte-for-byte plaintext and integrity checks;
-- identical before/after snapshots for all 24 ordinary PIV slots, including
-  public keys, origin, PIN policy and touch policy.
+| Operation | Result |
+| --- | --- |
+| GnuPG v4 Ed25519/SHA-512 detached signing | Verified independently by stock GnuPG and installed PQ Mail |
+| GnuPG decrypts PQ Mail's ML-KEM-768/X25519 message | Integrity passed; plaintext matched exactly |
+| GnuPG decrypts the fixed GnuPG sender's ML-KEM-768/X25519 message | Integrity passed; plaintext matched exactly |
+| GnuPG v4 Ed25519/SHA-256 detached signing | Verified independently by stock GnuPG and installed PQ Mail |
+| Installed PQ Mail decrypts the fixed GnuPG sender's v6-PKESK/v4-recipient message | Integrity and exact plaintext passed; detached Ed25519 signature verified separately |
 
-The fixed GnuPG sender is explicitly distinguished from stock GnuPG: stock
-2.5.24 emitted an incorrectly padded v4 fingerprint in a v6 PKESK packet.
-The connector-review changes have software regression coverage; they have not
-been followed by another hardware operation. Device-specific launchers,
-credentials, public account certificates and local result directories are not
-included in this source snapshot.
+Both signatures are **classical Ed25519**; the three decryptions are hybrid.
+The test ciphertexts contain no inline signature. The separate detached
+signature check must not be described as an inline-signed encrypted message.
+Stock GnuPG's isolated verifier may report unknown ownertrust: successful
+cryptographic verification does not confer contact trust.
 
-## Developer hardware harness
+Before/after snapshots matched for all **24 ordinary PIV slots: 10 occupied
+and 14 empty**, including public keys, origin, PIN policy and touch policy.
+The installed backend hashes also matched. No hardware keys, token
+certificates, touch policies or mail were changed by the tests. These counts
+record the tested card's existing state; the harness does not require every
+future card to have exactly ten occupied slots.
 
-The generic `pqmail/hardware_test.py` harness is included, but its account and
-serial selections are supplied locally through arguments. It uses the existing
-multi-project integration workspace, rather than installing dependencies or
-altering the user's system GnuPG. `--root` must identify that workspace, with:
+The fixed sender is explicitly distinguished from stock GnuPG: stock 2.5.24
+emitted an incorrectly padded v4 fingerprint in a v6 PKESK. The generic fix
+remains on the separate
+[`fix/v6-pkesk-v4-fingerprint-length`](https://github.com/ve7jtb/gnupg/tree/fix/v6-pkesk-v4-fingerprint-length)
+branch. Device-specific launchers, credentials, account certificates and local
+hardware result files are not published.
 
-- the tested development GnuPG build under `work/gnupg-releases/gnupg-2.5.24`;
-- Sequoia's built `piv-restore`/`piv-test` tools and hardware snapshot module
-  under `work/sequoia`;
-- the PQ Mail app/backend under `outputs/pq-mail-desktop` and its compiled
-  public-only Java interoperability fixtures (`PqMailInterop` and
-  `V4HardwareInterop`) under `outputs/sequoia-piv-test` and
-  `outputs/gnupg-v4-hardware` respectively;
-- the matching PQ Mail jar/libraries and patched Java runtime, plus stock
-  GnuPG and ykman at the Mac paths shown in the harness.
+## Reusable five-operation v4 hardware harness
 
-The required experimental GnuPG core build is separate from this connector
-snapshot. It is not sufficient to compile the unchanged C sources on this
-branch and assume full hybrid operation support. The harness retains the
-paths used for the measured Mac integration; it is not a cross-platform
-installer.
+[`pqmail/review_v4_test.py`](pqmail/review_v4_test.py) runs the three-operation
+connector test, then the SHA-256 and installed-PQ-Mail receive regressions.
+Device selection and installed application/runtime paths are explicit local
+arguments. The default development GnuPG build is
+`work/gnupg-releases/gnupg-2.5.24` under `--root`, overridable with `--gpg-build`.
+Stock GnuPG and ykman default to the Homebrew Mac paths shown by `--help` and
+can also be overridden. This is a Mac integration harness, not an installer.
 
-For an already prepared workspace, first run the PIN-free preflight:
+`--root` identifies a prepared multi-project integration workspace containing:
+
+- Sequoia's built `work/sequoia/target/debug/piv-restore` and read-only snapshot
+  module at `work/sequoia/piv-adapter/hardware/run.py`;
+- a tested development GnuPG build with the connector core hooks and fixed
+  v6-PKESK sender (`g10/gpg`, `agent/gpg-agent`, `tools/gpg-connect-agent`);
+- PQ Mail's installed Mac app, patched Java runtime and the public Java test
+  drivers compiled using the commands below.
+
+The experimental GnuPG core is separate from this connector branch. Compiling
+its unchanged upstream C sources alone does not add all hybrid operations.
+The Python connector never silently changes the installed GnuPG or PQ Mail.
+
+Build the public drivers from the matching
+[PQ Mail hardware-test sources](https://github.com/ve7jtb/pq-mail/tree/feature/on-key-certificates/tests/hardware).
+Set `PQ_MAIL_SOURCE`, `JAVA_HOME`, `APP_DIR` and `HELPER_CLASSES` to local paths;
+`APP_DIR` names the chosen app's `Contents/app` directory. Keep helper classes
+and result directories outside the application bundle.
 
 ```sh
-python3 -I -B pqmail/hardware_test.py --root "$INTEGRATION_ROOT" \
-  --out "$NEW_RESULT_DIRECTORY" --serial "$TEST_YUBIKEY_SERIAL" \
-  --profile v4 --preflight-only
+JAVA_HOME="$JAVA_HOME" "$PQ_MAIL_SOURCE/tests/hardware/build-v4-interop.sh" \
+  "$APP_DIR" "$HELPER_CLASSES" --self-test
 ```
 
-Use a fresh result directory and omit `--preflight-only` for the authorized
-three-operation test. Supply `--email "$TEST_EMAIL"` for an explicit v5 local
-certificate test. PINs are entered only in hidden Terminal prompts. No test
-provisions hardware keys, changes touch policy, writes token certificates or
-sends mail. The v5 flow creates a local certificate from existing keygrips.
+The driver-only class directory and the selected installed app's jars are the
+entire Java classpath. The helpers check that `OpenPgp.class` actually came
+from that app's `hybrid-mail.jar`, rejecting a shadow copy. The self-test uses
+disposable software fixtures and does not request a PIN or access a card.
+
+First run the PIN-free public preflight with a new result directory:
+
+```sh
+python3 -I -B pqmail/review_v4_test.py --root "$INTEGRATION_ROOT" \
+  --out "$NEW_RESULT_DIRECTORY" --serial "$TEST_YUBIKEY_SERIAL" \
+  --app-dir "$APP_DIR" --java "$JAVA_HOME/bin/java" \
+  --helper-classes "$HELPER_CLASSES" --gpg-build "$GPG_BUILD" \
+  --preflight-only
+```
+
+The preflight restores and verifies the public bundle, matches its keys to the
+live device, prepares both senders' synthetic ciphertexts and validates the
+fixed sender's packet with the installed receiver. It requests no PIN. Use
+another fresh result directory and omit `--preflight-only` for the explicitly
+authorized five-operation run. Expect **five hidden Terminal PIN prompts**,
+one per logical signature or hybrid decryption. Touch only when the existing
+policy requires it. The harness never retries a failed private operation.
+
+The wrapper records fresh backend hashes and all 24 slot snapshots before
+starting and again after success or failure. A missing device, incomplete
+snapshot or changed file prevents an unchanged-state success claim. It rejects
+an existing result directory or a result path within the selected app bundle.
+The result root contains `before.json`, `after.json`, `backend-before.json`,
+`backend-after.json` and the overall result. `operations/` contains the public
+restore, synthetic fixtures, separate GnuPG status logs, public Java
+verification output, and the supplemental `sha256/` checks. Keep those local
+results private: public certificate and serial metadata are not secrets, but
+may identify the owner or device.
+
+The lower-level [`pqmail/hardware_test.py`](pqmail/hardware_test.py) remains
+available for v4/v5/v6 integration work. For v4, supply the same `--app-dir`,
+`--java` and `--helper-classes` arguments to use these current public drivers.
+The older v5/v6 experiments still depend on their separate prepared fixtures.
+V5 remains opt-in and requires `--email` for its locally generated test
+certificate. None of these harnesses provisions hardware keys, changes token
+policy, writes token certificates or sends mail.
 
 ## Upstream contributions
 

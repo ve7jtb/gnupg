@@ -1,8 +1,23 @@
 """Existing v4 certificate / RFC 9980 hardware interoperability, without writes."""
 import getpass
+import os
 from pathlib import Path
 import subprocess
 import tempfile
+
+
+def require_status(label, status):
+    """Require complete GnuPG status lines, in addition to exit and byte checks."""
+    lines = status.splitlines()
+    if label == 'v4-signing':
+        # D/22/10 identifies a detached legacy Ed25519/SHA-512 signature.
+        valid = any(line.startswith(b'[GNUPG:] SIG_CREATED D 22 10 ') for line in lines)
+    else:
+        # Both fixtures use SEIPD v1: a successful decrypt must have checked
+        # the MDC, not merely produced some plaintext before an integrity error.
+        valid = all(line in lines for line in (b'[GNUPG:] DECRYPTION_OKAY', b'[GNUPG:] GOODMDC'))
+    if not valid:
+        raise RuntimeError('Missing expected '+label+' status; no retry')
 
 
 def test(root, out, home, build, config, run, preflight=False):
@@ -32,14 +47,16 @@ def test(root, out, home, build, config, run, preflight=False):
             kind = None
     if not primary or not hybrid or len(primary) != 40 or len(hybrid) != 40:
         raise ValueError('Expected v4 primary and hybrid subkey fingerprints')
-    java = root/'work/hybrid-mail/tools/zulu25.38.201-ca-jdk25.0.5.1-macosx_aarch64/Contents/Home/bin/java'
-    cp = str(root/'outputs/gnupg-v4-hardware/classes')+':'+str(root/'outputs/hybrid-mail-source/build/hybrid-mail.jar')+':'+str(root/'outputs/hybrid-mail-source/lib/*')
-    java = [java,'-cp',cp,'dev.hybridmail.V4HardwareInterop']
-    run(java+['prepare',cert,out], 'pqmail-v4-prepare')
+    # Never mix a source-tree jar with an installed backend. Only the isolated
+    # public test classes and the selected app's own jars enter this classpath.
+    java = Path(config['test_java'])
+    cp = str(Path(config['test_classes']))+os.pathsep+str(Path(config['backend_app'])/'*')
+    java = [java,'-Djava.awt.headless=true','-cp',cp,'dev.hybridmail.V4HardwareInterop']
+    run(java+['prepare',cert,out,config['backend_app']], 'pqmail-v4-prepare')
     # Stock GnuPG has only public keys in its own short-lived test home.
     stockhome = Path(tempfile.mkdtemp(prefix='pqv4-peer-',dir='/private/tmp'))
     (stockhome/'gpg-agent.conf').write_text('disable-scdaemon\n')
-    stock = ['/opt/homebrew/bin/gpg','--homedir',stockhome,'--batch','--yes','--allow-9980']
+    stock = [config['stock_gpg'],'--homedir',stockhome,'--batch','--yes','--allow-9980']
     run(stock+['--import',cert], 'stock-v4-import')
     # The ! pins the hybrid subkey, excluding the certificate's optional
     # classical encryption subkey and any automatic recipient substitution.
@@ -49,6 +66,12 @@ def test(root, out, home, build, config, run, preflight=False):
     sender = [build/'g10/gpg','--homedir',stockhome,'--batch','--yes','--allow-9980']
     run(sender+['--trust-model','always','--recipient',hybrid+'!','--output',out/'fixed-gpg-v4-encrypted.pgp',
                '--encrypt',out/'message.txt'], 'fixed-gpg-v4-encrypt')
+    # Check the fixed sender's packet shape against the installed receiver
+    # before any PIN request. An unpatched sender must not pass preflight just
+    # because it exited successfully while writing a malformed fingerprint.
+    receive = java[:-1]+['dev.hybridmail.V4InstalledReceive']
+    run(receive+['--preflight',out/'restored',out,config['backend_app'],config['device_serial']],
+        'pqmail-v4-receive-preflight')
     if preflight:
         (out/'preflight.txt').write_text('PASS restored v4 bindings/live keys, shadow mappings and PQ Mail/fixed GnuPG hybrid ciphertext preparation; no private operations\n')
         print('PASS v4 read-only preflight',flush=True)
@@ -66,13 +89,14 @@ def test(root, out, home, build, config, run, preflight=False):
         try:
             if not 6 <= len(pin) <= 8 or any(x < 32 or x > 126 for x in pin):
                 raise ValueError('Invalid PIN format; no private operation')
-            run(gpg+['--status-fd','1','--pinentry-mode','loopback','--passphrase-fd','0']+args,label,pin+b'\n')
+            status = run(gpg+['--status-fd','1','--pinentry-mode','loopback','--passphrase-fd','0']+args,label,pin+b'\n')
+            require_status(label, status)
         finally:
             pin[:] = b'\0'*len(pin)
             subprocess.run([str(build/'tools/gpg-connect-agent'),'--homedir',str(home),'KILLAGENT','/bye'],capture_output=True,timeout=10)
         if label == 'v4-signing':
             run(stock+['--verify',out/'v4-signature.pgp',out/'message.txt'],'stock-v4-verify')
-            run(java+['verify',cert,out],'pqmail-v4-verify')
+            run(java+['verify',cert,out,config['backend_app']],'pqmail-v4-verify')
         else:
             plain = out/label.replace('-decryption','-plain.txt')
             if plain.read_bytes() != (out/'message.txt').read_bytes():

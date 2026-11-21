@@ -20,15 +20,21 @@ def main():
     p.add_argument('--serial', required=True, help='Explicit serial of the existing test key')
     p.add_argument('--email', help='Email for a local v5 test certificate; required only for --profile v5')
     p.add_argument('--out', type=Path, required=True)
+    p.add_argument('--app-dir', type=Path, help='Installed PQ Mail Contents/app directory')
+    p.add_argument('--java', type=Path, help='Java executable for public interoperability helpers')
+    p.add_argument('--helper-classes', type=Path, help='Compiled v4 interoperability helpers only')
+    p.add_argument('--gpg-build', type=Path, help='Tested development GnuPG build directory')
+    p.add_argument('--stock-gpg', default='/opt/homebrew/bin/gpg')
+    p.add_argument('--ykman', default='/usr/local/bin/ykman')
     p.add_argument('--preflight-only', action='store_true')
     p.add_argument('--profile', choices=('v6','v5','v4'), default='v6')
     a = p.parse_args()
     root = a.root.resolve()
     out = a.out.resolve()
     out.mkdir(mode=0o700, parents=True, exist_ok=False)
-    app = root/'outputs/pq-mail-desktop/PQ Mail.app/Contents/app'
-    source = root/'work/gnupg/pqmail'
-    build = root/'work/gnupg-releases/gnupg-2.5.24'
+    app = (a.app_dir or root/'outputs/pq-mail-desktop/PQ Mail.app/Contents/app').resolve()
+    source = Path(__file__).resolve().parent
+    build = (a.gpg_build or root/'work/gnupg-releases/gnupg-2.5.24').resolve()
     # Device/account selection belongs to the local launcher, never public
     # source defaults. Validate before taking snapshots or prompting for a PIN.
     serial = a.serial
@@ -41,7 +47,7 @@ def main():
     spec = importlib.util.spec_from_file_location('piv_snapshot', root/'work/sequoia/piv-adapter/hardware/run.py')
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    device = argparse.Namespace(ykman='/usr/local/bin/ykman', serial=serial)
+    device = argparse.Namespace(ykman=a.ykman, serial=serial)
     # Capture the full public state before restoring or asking for a PIN. A
     # final snapshot failure is not evidence of unchanged state and must fail
     # the run even if individual cryptographic operations already succeeded.
@@ -57,6 +63,11 @@ def main():
         result = subprocess.run([str(x) for x in args], input=secret,
                                 capture_output=True, timeout=180)
         (out/(name+'.log')).write_bytes(result.stderr)
+        if name.endswith(('-prepare', '-verify')):
+            # Public-only fixture/verification drivers print useful PASS
+            # evidence on stdout. Preserve it separately from stderr; this
+            # branch is never used for a secret-bearing backend response.
+            (out/(name+'.stdout')).write_bytes(result.stdout)
         if name.endswith('-decryption') or name == 'v4-signing':
             # These GPG invocations use --status-fd 1 and a separate output
             # file: retain public status codes, never PIN or plaintext pipes.
@@ -89,7 +100,12 @@ def main():
                     raise RuntimeError('Restored public key hash mismatch')
                 keys.append(dict(spki=base64.b64encode(der).decode(), reference='PIV.'+slot.upper(),
                                  usage=usage or ('s' if i == 0 else 'e')))
-        config = dict(wire_profile=a.profile, email=a.email, serial='D27600012401'+format(int(serial), '08X'), device_serial=serial,
+        # Public test paths are explicitly supplied by the caller. In the v4
+        # profile both encryption and verification use this same app jar.
+        test_java = (a.java or root/'work/hybrid-mail/tools/zulu25.38.201-ca-jdk25.0.5.1-macosx_aarch64/Contents/Home/bin/java').resolve()
+        test_classes = (a.helper_classes or root/'outputs/gnupg-v4-hardware/classes').resolve()
+        config = dict(test_java=str(test_java), test_classes=str(test_classes), stock_gpg=a.stock_gpg,
+                      wire_profile=a.profile, email=a.email, serial='D27600012401'+format(int(serial), '08X'), device_serial=serial,
                       libgcrypt='/opt/homebrew/lib/libgcrypt.dylib', keys=keys,
                       backend_app=str(app), prompt='YubiKey PIN (not a password)',
                       component_command=['/usr/bin/python3', '-I', '-B', str(source/'component.py'), str(home/'bridge.json')])
