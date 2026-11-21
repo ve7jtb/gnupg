@@ -7,7 +7,7 @@ private data is passed only to a short-lived process through anonymous pipes.
 Hardware adapters may reuse this protocol without becoming dependencies of the
 software branch. No generation, key import, deletion or card APDU is exposed.
 """
-import base64, ctypes, hashlib, json, os, re, signal, subprocess, sys, selectors, time
+import base64, ctypes, hashlib, json, os, re, signal, subprocess, sys, selectors, time, stat
 from pathlib import Path
 # This is the aggregate decoded SETDATA bound, separate from Assuan's
 # per-line limit. ML-KEM ciphertexts arrive over several hex-encoded lines.
@@ -52,6 +52,86 @@ def public_key(der, legacy=False):
             return alg,raw,sexp(atom('public-key'),key)
     raise ValueError('Unsupported SPKI')
 
+# Diagnostics are classifications, never child stderr. A backend can fail after
+# the caller supplied a PIN, and GnuPG otherwise reduces every bridge rejection
+# to "Not supported". Keep the useful stage while discarding arbitrary text.
+COMPONENT_STAGES = ('request', 'pin-format', 'identity-binding', 'slot-mapping',
+                    'payload', 'adapter', 'result')
+NATIVE_STAGES = ('arguments', 'input', 'PIN callback setup', 'providers',
+                 'public key check', 'PIN input', 'private key check', 'recover', 'output')
+
+
+class PrivateOperationError(ValueError):
+    """A failed child, with an optional fixed-vocabulary public classification."""
+    def __init__(self, diagnostic=None):
+        super().__init__('Private component failed; no retry')
+        self.diagnostic = diagnostic
+
+
+class SafeDiagnostics:
+    """Read bounded stderr lines without retaining or returning arbitrary data."""
+    def __init__(self):
+        self.pending = bytearray()
+        self.dropping = False
+        self.value = None
+
+    def feed(self, chunk):
+        # A child controls chunk boundaries, so exact line matching must survive
+        # a marker split across writes. Oversized lines are ignored in full.
+        for octet in chunk:
+            if octet == 10:
+                if not self.dropping:
+                    self.match(bytes(self.pending))
+                self.pending[:] = b'\0' * len(self.pending)
+                self.pending.clear()
+                self.dropping = False
+            elif not self.dropping:
+                if len(self.pending) == 2048:
+                    self.pending[:] = b'\0' * len(self.pending)
+                    self.pending.clear()
+                    self.dropping = True
+                else:
+                    self.pending.append(octet)
+
+    def match(self, line):
+        # A later generic helper error must not hide an authentication failure.
+        if self.value and self.value.split()[-1] in ('pin-incorrect', 'pin-invalid', 'pin-expired'):
+            return
+        # Only these exact provider reason phrases become PIN classifications.
+        # Native error numbers, arbitrary reason text and input bytes are not
+        # included in the diagnostic. Authentication errors take precedence.
+        for reason, category in ((b'The specified PIN is incorrect', 'pin-incorrect'),
+                                 (b'The specified PIN is invalid', 'pin-invalid'),
+                                 (b'The specified PIN has expired', 'pin-expired')):
+            if re.search(rb'(?:^|; )PQMAIL_ERROR [0-9A-F]{8,16} ' + reason + rb'(?:; |$)', line):
+                self.value = category
+                return
+        for stage in COMPONENT_STAGES:
+            prefix = ('PQMAIL_COMPONENT_ERROR ' + stage).encode()
+            if line == prefix:
+                self.value = stage
+                return
+            # Only the adapter stage can attach a known native helper stage.
+            if stage == 'adapter':
+                for native in (*NATIVE_STAGES, 'pin-incorrect', 'pin-invalid', 'pin-expired'):
+                    token = native.lower().replace(' ', '-')
+                    if line == prefix + b' ' + token.encode():
+                        self.value = stage + ' ' + token
+                        return
+        for algorithm in ('X25519', 'ML-KEM-768'):
+            prefix = ('PQ Mail: Single-process PKCS#11 ' + algorithm + ' failed at ').encode()
+            for stage in NATIVE_STAGES:
+                # The wrapper already sanitizes numeric native errors; we need
+                # only the closed stage prefix, never the remaining error text.
+                if line.startswith(prefix + stage.encode() + b'; no retry'):
+                    self.value = stage.lower().replace(' ', '-')
+                    return
+
+    def clear(self):
+        self.pending[:] = b'\0' * len(self.pending)
+        self.pending.clear()
+
+
 def bounded_run(command, request, env, timeout=120, limit=12000, own_group=True):
     """Drive all three pipes under one deadline without secret-owning threads.
 
@@ -65,6 +145,7 @@ def bounded_run(command, request, env, timeout=120, limit=12000, own_group=True)
     child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, env=env, start_new_session=own_group)
     output = bytearray()
+    diagnostic = SafeDiagnostics()
     seen = {'stdout': 0, 'stderr': 0}
     sent = 0
     selector = selectors.DefaultSelector()
@@ -120,8 +201,10 @@ def bounded_run(command, request, env, timeout=120, limit=12000, own_group=True)
                             raise ValueError('Private component failed; no retry')
                         if role == 'stdout':
                             output.extend(chunk)
-                        # Stderr is drained and counted, never retained or
-                        # reported: helpers can accidentally print secrets.
+                        else:
+                            # Keep only an allowlisted failure stage. Raw lines
+                            # and incomplete fragments are wiped after parsing.
+                            diagnostic.feed(chunk)
                 except BlockingIOError:
                     continue
                 except InterruptedError:
@@ -129,7 +212,7 @@ def bounded_run(command, request, env, timeout=120, limit=12000, own_group=True)
             status = child.poll()
             if status is not None and not selector.get_map():
                 if status or sent != len(request):
-                    raise ValueError('Private component failed; no retry')
+                    raise PrivateOperationError(diagnostic.value)
                 return bytes(output)
     except (OSError, subprocess.SubprocessError):
         raise ValueError('Private component failed; no retry') from None
@@ -149,6 +232,7 @@ def bounded_run(command, request, env, timeout=120, limit=12000, own_group=True)
             # do not retain the secret in a waiter thread or retry the request.
             pass
         output[:] = b'\0'*len(output)
+        diagnostic.clear()
 
 
 class Bridge:
@@ -209,7 +293,45 @@ class Bridge:
             return data
         except BaseException:
             data[:]=b'\0'*len(data);raise
+    def record_failure(self, algorithm, diagnostic):
+        """Append only a fixed public category to an opt-in local test journal."""
+        target = self.config.get('diagnostic_file')
+        if not target:
+            return
+        allowed = set(COMPONENT_STAGES) | {'private-operation'}
+        allowed |= {'adapter '+s.lower().replace(' ', '-') for s in NATIVE_STAGES}
+        allowed |= {'adapter pin-incorrect', 'adapter pin-invalid', 'adapter pin-expired'}
+        category = diagnostic if diagnostic in allowed else 'private-operation'
+        if algorithm not in ('Ed25519', 'ML-DSA-65', 'X25519', 'ML-KEM-768'):
+            algorithm = 'unknown'
+        # The optional path is trusted local configuration, like the executable
+        # paths. Reject symlinks and non-owner/private files; never follow a
+        # recipient-provided path or fall back to logging arbitrary stderr.
+        try:
+            path = Path(target)
+            if not path.is_absolute():
+                return
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
+            fd = os.open(path, flags, 0o600)
+            try:
+                st = os.fstat(fd)
+                if st.st_uid != os.getuid() or st.st_mode & 0o077 or not stat.S_ISREG(st.st_mode):
+                    return
+                os.write(fd, ('FAIL '+algorithm+' '+category+'\n').encode('ascii'))
+            finally:
+                os.close(fd)
+        except OSError:
+            # Diagnostic storage must never hide the original operation error.
+            pass
+
     def operate(self,key,operation):
+        try:
+            return self._operate(key,operation)
+        except Exception as error:
+            self.record_failure(key.get('algorithm'),getattr(error,'diagnostic',None))
+            raise
+
+    def _operate(self,key,operation):
         # The caller supplies an OpenPGP digest or a raw KEM component input.
         # The bridge must not hash the digest again or implement its own
         # RFC/LibrePGP combiner; those protocol choices belong to GnuPG.
@@ -261,6 +383,16 @@ class Bridge:
                     self.line(b'S SERIALNO '+self.serial.encode()+b' 0')
                 elif cmd=='GETATTR' and args==['$DISPSERIALNO']:self.line(b'S $DISPSERIALNO '+self.serial.encode())
                 elif cmd=='GETATTR' and args==['APPTYPE']:self.line(b'S APPTYPE PIV')
+                elif cmd=='GETATTR' and args==['KEY-FPR']:
+                    # GnuPG probes this OpenPGP-card hint when no explicit
+                    # --local-user is given. PIV component keys can occur in
+                    # several v4/v5/v6 certificates, and a component keygrip
+                    # is not an OpenPGP fingerprint. Report successful absence
+                    # rather than inventing one or logging a card error after
+                    # an otherwise valid signature. GnuPG then selects from
+                    # its local keyring; callers needing a particular wire
+                    # profile must still pin that certificate's fingerprint.
+                    pass
                 # LEARN advertises verified restore metadata; it performs no
                 # live card read. Device/slot/SPKI matching is repeated by the
                 # private-operation backend before it uses a key.

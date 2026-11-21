@@ -37,7 +37,8 @@ Supported Level 3 component roles include ML-DSA-65, Ed25519, ML-KEM-768 and
 X25519. Current hardware routing covers signing, certification and compatibility
 slots. V6 is the preferred wire profile; the optional v5 metadata describes
 classical Ed25519 signatures and LibrePGP hybrid encryption. A certificate
-version does not itself establish post-quantum signature security.
+version does not itself establish post-quantum signature security. See the
+[format and interoperability matrix](pqmail/INTEROPERABILITY.md).
 
 ## Review fixes, November 21, 2026
 
@@ -54,7 +55,7 @@ PQ Mail/frontend/connector review:
    staging tree interrupted by process termination or power loss.
 3. Bridge and component processes share nonblocking pipe supervision. Input,
    both output streams and child completion share a deadline. Output limits
-   apply while reading, and diagnostics are never echoed to the caller.
+   apply while reading, and arbitrary child stderr is never echoed to the caller.
    No background I/O thread can retain a PIN/request after return.
 
 The trusted outer bridge sets `PQMAIL_SUPERVISED_PROCESS_GROUP=1`; nested
@@ -78,11 +79,15 @@ Run the software-only connector tests from this repository:
 python3 -B -m unittest discover -s pqmail/tests -v
 ```
 
-The connector and reusable harness now pass **39 software-only tests**: 24
-connector regressions and 15 orchestration/preflight regressions. Coverage
+The connector and reusable harness now pass **59 software-only tests**. Coverage
 includes SHA-256 compatibility, retained ML-DSA restrictions, patch rollback,
 blocked stdin, output limits, nested process cleanup, selected installed-jar
 paths, real GnuPG status lines, error stopping and final audits after failure.
+The added v5 tests cover exact component selection, two signers and two
+receivers, public preflight before message operations, required integrity
+statuses and backend audits. Metadata tests cover the absence of a unique PIV
+OpenPGP fingerprint hint; diagnostic tests reject arbitrary/oversized stderr
+and unsafe log destinations.
 The identical supervisor also passed seven executions on the separate software
 branch. Patch anchors were checked against clean GnuPG 2.5.23 and 2.5.24 sources.
 These automated checks use temporary fixtures and synthetic subprocesses;
@@ -118,6 +123,49 @@ remains on the separate
 [`fix/v6-pkesk-v4-fingerprint-length`](https://github.com/ve7jtb/gnupg/tree/fix/v6-pkesk-v4-fingerprint-length)
 branch. Device-specific launchers, credentials, account certificates and local
 hardware result files are not published.
+
+## V5 signing and hybrid decryption — November 21, 2026
+
+Existing-key hardware testing completed the optional **v5 compatibility**
+profile with GnuPG 2.5.24, this connector and the staged PQ Mail v5 build:
+
+| Operation | Result |
+| --- | --- |
+| Local v5 certificate creation from existing component keygrips | Passed; no hardware key generation or card certificate write |
+| GnuPG Ed25519/SHA-512 detached signing | Verified by PQ Mail and stock GnuPG |
+| PQ Mail Ed25519/SHA-512 detached signing | Verified by stock GnuPG |
+| GnuPG decrypts PQ Mail's ML-KEM-768/X25519 ciphertext | `DECRYPTION_OKAY`, `GOODMDC` and exact plaintext |
+| PQ Mail decrypts stock GnuPG's ML-KEM-768/X25519 ciphertext | Tag-20 OCB authentication and exact plaintext; detached signature verified separately |
+
+The message signer uses the existing dedicated **Ed25519 slot 88**. Hybrid
+decryption uses **ML-KEM-768 in 9d and X25519 in 85**, with combining performed
+on the host. This v5 profile uses LibrePGP algorithm 8 and its combiner; it is
+not the RFC 9980 algorithm-35 format used by the v4/v6 IETF profile. V5
+signatures remain **classical**, even when the accompanying encryption is
+hybrid. V6 remains the default; there is no automatic downgrade after failure.
+
+The certificate and both signatures were retained and reverified when resuming
+the two decryptions. The successful final run's before/after snapshots also
+matched the original baseline across all **24 ordinary slots (10 occupied,
+14 empty)**, including public keys, origin and PIN/touch policies. Selected
+PQ Mail backend hashes matched throughout. No hardware keys, card certificates
+or policies were changed, and no email was sent. These are detached-signature
+and encrypted-fixture tests, not inline-signed messages or a live v5 mail-UI test.
+
+The selected PQ Mail jar included the new v5 codec; this result does not assert
+that every installed release or desktop identity selector supports v5. The
+GnuPG receiver used the separately prepared development core with hardware
+component hooks; the sender and independent verifier used stock GnuPG 2.5.24.
+See [version boundaries and reproduction](pqmail/INTEROPERABILITY.md). This
+coverage requires a v5 primary and v5 subkey; it does not establish support for
+the mixed v4-primary/v5-subkey certificate created when stock GnuPG ignores
+these explicit batch version fields.
+
+A prior generic `Not supported` response did not establish an unsupported
+algorithm. The connector now optionally records only a fixed failure stage and
+algorithm in a local diagnostic file. It never records arbitrary child stderr,
+PINs or shared secrets, and it never retries a failed private operation. See
+[private-operation diagnostics](pqmail/INTEROPERABILITY.md#private-operation-diagnostics).
 
 ## Reusable five-operation v4 hardware harness
 
@@ -187,13 +235,23 @@ verification output, and the supplemental `sha256/` checks. Keep those local
 results private: public certificate and serial metadata are not secrets, but
 may identify the owner or device.
 
+For a reproducible software-only codec regression, the
+[disposable fixture generator](pqmail/INTEROPERABILITY.md#disposable-software-fixtures)
+uses fresh Java test keys, the prepared core for certificate/signature creation,
+and a separate stock GnuPG sender/verifier. Fresh generation and the PQ Mail
+codec test passed; no generated PKCS#12, account data or device artifacts are
+published.
+
 The lower-level [`pqmail/hardware_test.py`](pqmail/hardware_test.py) remains
 available for v4/v5/v6 integration work. For v4, supply the same `--app-dir`,
 `--java` and `--helper-classes` arguments to use these current public drivers.
-The older v5/v6 experiments still depend on their separate prepared fixtures.
-V5 remains opt-in and requires `--email` for its locally generated test
-certificate. None of these harnesses provisions hardware keys, changes token
-policy, writes token certificates or sends mail.
+The v5 path now uses the matching public Java drivers from
+`tests/hardware/build-v5-interop.sh`; its prepared candidate app must include the
+v5 codec. V5 remains opt-in and requires `--email` for its locally generated
+test certificate. See the [v5 reproduction commands](pqmail/INTEROPERABILITY.md#reproduce-the-v5-hardware-test).
+The v6 experiment still uses its separate prepared fixture drivers. None of
+these harnesses provisions hardware keys, changes token policy, writes token
+certificates or sends mail.
 
 ## Upstream contributions
 

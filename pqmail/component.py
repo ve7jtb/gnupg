@@ -63,6 +63,16 @@ def bounded_run(command, request, env, timeout=110, limit=16384):
                               own_group=not inherited_group)
 
 
+class ComponentError(ValueError):
+    """Carry only an allowlisted public failure stage across the child pipe."""
+    def __init__(self, stage, detail=None):
+        allowed = ('arguments', 'input', 'pin-callback-setup', 'providers',
+                   'public-key-check', 'pin-input', 'private-key-check', 'recover',
+                   'output', 'pin-incorrect', 'pin-invalid', 'pin-expired')
+        self.diagnostic = stage + (' '+detail if stage=='adapter' and detail in allowed else '')
+        super().__init__('GnuPG PIV component failed; no retry')
+
+
 def main():
     """Only locally configured paths/slots may route a private operation."""
     config = json.loads(Path(sys.argv[1]).read_text())
@@ -72,17 +82,22 @@ def main():
     fields = [sys.stdin.buffer.readline(8193) for _ in range(4)]
     pin = bytearray(fields.pop().rstrip(b'\n'))
     request = bytearray()
+    stage = 'request'
     try:
         if any(len(x) > 8192 or not x.endswith(b'\n') for x in fields):
             raise ValueError('Malformed component input')
+        stage = 'pin-format'
         if not 6 <= len(pin) <= 8 or any(x < 32 or x > 126 for x in pin):
             raise ValueError('Invalid PIV PIN format')
+        stage = 'request'
         algorithm = fields[0].strip().decode('ascii')
         public, incoming = [base64.b64decode(x.strip(), validate=True) for x in fields[1:]]
         # Match the full SPKI, not just an algorithm or a caller-supplied slot.
+        stage = 'identity-binding'
         matches = [k for k in config['keys'] if base64.b64decode(k['spki'], validate=True) == public]
         if len(matches) != 1:
             raise ValueError('Key is not uniquely mapped in this identity')
+        stage = 'slot-mapping'
         slot = matches[0]['reference'].split('.')[-1].lower()
         # These are the currently implemented Level 3 hardware roles, not an
         # unrestricted PIV slot selector. A future manifest layout must extend
@@ -111,16 +126,21 @@ def main():
             env['PQMAIL_CERTIFICATION_SLOTS'] = '86,87'
         if slot in ('88', '89'):
             env['PQMAIL_COMPATIBILITY_SLOT'] = slot
+        stage = 'payload'
         converted = payload(algorithm, public, incoming)
         request.extend(algorithm.encode() + b'\n' + base64.b64encode(public) + b'\n')
         request.extend(base64.b64encode(converted) + b'\n' + pin + b'\n')
+        stage = 'adapter'
         reply = bounded_run(['/usr/bin/python3', '-I', '-B', str(script)], request, env)
         # Signing helpers return base64; KEM helpers return raw shared secrets.
+        stage = 'result'
         raw = base64.b64decode(reply.strip(), validate=True) if signing else reply
         expected = {'ML-DSA-65': 3309, 'Ed25519': 64, 'ML-KEM-768': 32, 'X25519': 32}[algorithm]
         if len(raw) != expected:
             raise ValueError('Wrong private-operation result length')
         sys.stdout.buffer.write(base64.b64encode(raw) + b'\n')
+    except Exception as error:
+        raise ComponentError(stage, getattr(error, 'diagnostic', None)) from None
     finally:
         # Clear buffers under our control; immutable Python/subprocess copies
         # can outlive this overwrite, so the helper process is also short-lived.
@@ -131,7 +151,9 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except Exception:
-        # Never echo inputs, child stderr, PINs or shared secrets to logs.
-        print('GnuPG PIV component failed; no retry', file=sys.stderr)
+    except Exception as error:
+        # Only a closed stage/category crosses stderr. Never include exception
+        # messages, input values, raw child stderr, PINs or shared secrets.
+        category = error.diagnostic if isinstance(error, ComponentError) else 'request'
+        print('PQMAIL_COMPONENT_ERROR '+category, file=sys.stderr)
         sys.exit(1)

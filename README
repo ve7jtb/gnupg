@@ -7,6 +7,14 @@
           Copyright 2003-2026 g10 Code GmbH
 
 
+* PQ MAIL CONNECTOR DEVELOPMENT BRANCH
+
+  See README.PQMAIL.md for the YubiKey/PIV connector, verified v4 and optional
+  v5 interoperability tests, and the separate GnuPG core-development branch.
+  V6 remains the connector's default profile. This branch does not turn the
+  unchanged upstream core into a full hybrid OpenPGP implementation.
+
+
 * INTRODUCTION
 
   GnuPG is a complete and free implementation of the OpenPGP standard

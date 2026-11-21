@@ -22,7 +22,7 @@ def main():
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--app-dir', type=Path, help='Installed PQ Mail Contents/app directory')
     p.add_argument('--java', type=Path, help='Java executable for public interoperability helpers')
-    p.add_argument('--helper-classes', type=Path, help='Compiled v4 interoperability helpers only')
+    p.add_argument('--helper-classes', type=Path, help='Compiled public interoperability helpers matching the selected profile')
     p.add_argument('--gpg-build', type=Path, help='Tested development GnuPG build directory')
     p.add_argument('--stock-gpg', default='/opt/homebrew/bin/gpg')
     p.add_argument('--ykman', default='/usr/local/bin/ykman')
@@ -100,8 +100,9 @@ def main():
                     raise RuntimeError('Restored public key hash mismatch')
                 keys.append(dict(spki=base64.b64encode(der).decode(), reference='PIV.'+slot.upper(),
                                  usage=usage or ('s' if i == 0 else 'e')))
-        # Public test paths are explicitly supplied by the caller. In the v4
-        # profile both encryption and verification use this same app jar.
+        # Public test paths are explicitly supplied by the caller. In v4 and v5,
+        # encryption, signing and verification select this same reviewed app
+        # jar; helper classes must match the selected wire profile.
         test_java = (a.java or root/'work/hybrid-mail/tools/zulu25.38.201-ca-jdk25.0.5.1-macosx_aarch64/Contents/Home/bin/java').resolve()
         test_classes = (a.helper_classes or root/'outputs/gnupg-v4-hardware/classes').resolve()
         config = dict(test_java=str(test_java), test_classes=str(test_classes), stock_gpg=a.stock_gpg,
