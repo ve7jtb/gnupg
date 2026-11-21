@@ -324,7 +324,8 @@ sample_msgs = samplemsgs/clearsig-1-key-1.asc \
 EXTRA_DIST = defs.scm trust-pgp/common.scm $(XTESTS) $(TEST_FILES) \
 	     mkdemodirs signdemokey $(priv_keys) $(sample_keys)   \
 	     $(sample_msgs) ChangeLog-2011 run-tests.scm \
-	     setup.scm shell.scm all-tests.scm signed-messages.scm
+	     setup.scm shell.scm all-tests.scm signed-messages.scm \
+             v6-pkesk-v4-fingerprint.py v4-mlkem768-public.asc
 
 CLEANFILES = prepared.stamp x y yy z out err  $(data_files) \
 	     plain-1 plain-2 plain-3 trustdb.gpg *.lock \

@@ -1090,7 +1090,9 @@ do_pubkey_enc_v6 (iobuf_t out, int ctb, PKT_pubkey_enc *enc)
        * conveys the full fingerprint.  */
       iobuf_put (a, (enc->fprlen == 32? 32 : 20) + 1);
       iobuf_put (a, enc->fprlen == 32? 6 : 4);  /* The _key_ version.  */
-      iobuf_write (a, enc->fpr, sizeof enc->fpr);
+      /* The buffer also holds v6 fingerprints.  For a v4 recipient,
+       * emit only the advertised 20 bytes, not its 32-byte capacity.  */
+      iobuf_write (a, enc->fpr, enc->fprlen);
     }
 
   iobuf_put (a, enc->pubkey_algo );
